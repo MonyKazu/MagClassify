@@ -1,19 +1,162 @@
-//  MagDirectionApp.swift
+//
+//  ContentView.swift
 //  Real‑time magnet position classification using calibrated device‑frame magnetic field (device_x, device_y, device_z)
 //
 //  ▶︎ 手順
-//    1. ContentView1.swift で提供されている MagneticFieldProcessor を **そのまま** プロジェクトに含める。
-//       （地磁気キャリブレーション機能付き。currentMagneticField が μT 単位の device‑frame 磁場を公開）
-//    2. Create ML Tabular Classifier で学習したモデル（入力: device_x, device_y, device_z / 出力: TargetDirection）
-//       を Xcode プロジェクトに追加し、ここでは **MagDirectionClassifier.mlmodel** とする。
-//    3. 本ファイルを追加してビルド → 実機で較正 → 方向判定を確認。
+//    1. 本ファイルをプロジェクトに追加する。
+//    2. Create ML で学習したモデル（入力: device_x, device_y, device_z / 出力: TargetDirection）
+//       を Xcode プロジェクトに追加し、モデルのクラス名が参照と一致するようにする。
+//       （例: MagDirectionClassifier.mlmodel）
+//    3. ビルドし、実機で「較正」ボタンを押してキャリブレーションを実行する。
+//    4. 磁石をiPhoneの背面に近づけ、方向が正しく判定されることを確認する。
 //
 //  ©2025 Kazuya Ishikawa – MIT License
+//
 
 import SwiftUI
 import CoreML
+import CoreMotion
 import Combine
 import simd
+
+// MARK: - 磁気較正パラメータ
+struct CalibrationParameters {
+    var hardIronOffset: SIMD3<Double> = .zero
+    var softIronMatrix: simd_double3x3 = matrix_identity_double3x3
+    var isCalibrated: Bool = false
+}
+
+// MARK: - 磁気データ処理クラス
+class MagneticFieldProcessor: ObservableObject {
+    private let motionManager = CMMotionManager()
+    private var calibrationData: [SIMD3<Double>] = []
+    private var calibrationParameters = CalibrationParameters()
+
+    // --- UI更新用プロパティ ---
+    @Published var isCalibrating = false
+    @Published var isRecording = false
+    @Published var debugInfo = "較正ボタンを押してキャリブレーションを開始してください。"
+    @Published var currentMagneticField = SIMD3<Double>.zero
+
+    init() {
+        setupMotionUpdates()
+    }
+
+    private func setupMotionUpdates() {
+        guard motionManager.isDeviceMotionAvailable else {
+            debugInfo = "Device Motion is not available."
+            return
+        }
+
+        motionManager.deviceMotionUpdateInterval = 1.0 / 100.0 // 100Hz
+        motionManager.showsDeviceMovementDisplay = true
+
+        motionManager.startDeviceMotionUpdates(using: .xMagneticNorthZVertical, to: .main) { [weak self] motion, error in
+            guard let self = self, let motion = motion, error == nil else {
+                print(error?.localizedDescription ?? "Unknown error")
+                return
+            }
+            self.processMotionData(motion)
+        }
+    }
+
+    private func processMotionData(_ motion: CMDeviceMotion) {
+        let rawField = SIMD3<Double>(motion.magneticField.field.x, motion.magneticField.field.y, motion.magneticField.field.z)
+
+        if isCalibrating {
+            collectCalibrationData(rawField)
+            let progress = min(1.0, Double(calibrationData.count) / (30.0 * 100.0))
+            debugInfo = String(format: "8の字を描いて較正中... (%.0f%%)", progress * 100)
+        } else if calibrationParameters.isCalibrated {
+            let deviceFrameField = processField(rawField: rawField, attitude: motion.attitude)
+            
+            DispatchQueue.main.async {
+                self.currentMagneticField = deviceFrameField
+                let magnitude = simd_length(deviceFrameField)
+                self.debugInfo = String(format: "較正完了 - 磁場強度: %.1f μT", magnitude)
+            }
+        }
+    }
+    
+    // MARK: - 較正処理
+    func startCalibration() {
+        isCalibrating = true
+        calibrationData.removeAll()
+        calibrationParameters.isCalibrated = false
+        debugInfo = "8の字を描くようにデバイスを動かしてください（30秒間）"
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+            self?.completeCalibration()
+        }
+    }
+
+    private func collectCalibrationData(_ field: SIMD3<Double>) {
+        calibrationData.append(field)
+    }
+
+    private func completeCalibration() {
+        isCalibrating = false
+        guard calibrationData.count > 100 else {
+            debugInfo = "較正失敗：データ不足。再度お試しください。"
+            return
+        }
+
+        let params = calculateCalibrationParameters(from: calibrationData)
+        self.calibrationParameters = params
+        debugInfo = "較正完了。磁石を近づけてください。"
+    }
+    
+    private func calculateCalibrationParameters(from data: [SIMD3<Double>]) -> CalibrationParameters {
+        var params = CalibrationParameters()
+        guard !data.isEmpty else { return params }
+
+        let minX = data.map { $0.x }.min() ?? 0
+        let maxX = data.map { $0.x }.max() ?? 0
+        let minY = data.map { $0.y }.min() ?? 0
+        let maxY = data.map { $0.y }.max() ?? 0
+        let minZ = data.map { $0.z }.min() ?? 0
+        let maxZ = data.map { $0.z }.max() ?? 0
+
+        params.hardIronOffset = SIMD3<Double>((minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2)
+
+        let rangeX = max(maxX - minX, 1.0)
+        let rangeY = max(maxY - minY, 1.0)
+        let rangeZ = max(maxZ - minZ, 1.0)
+        let avgRange = (rangeX + rangeY + rangeZ) / 3
+
+        params.softIronMatrix = simd_double3x3(
+            SIMD3<Double>(avgRange / rangeX, 0, 0),
+            SIMD3<Double>(0, avgRange / rangeY, 0),
+            SIMD3<Double>(0, 0, avgRange / rangeZ)
+        )
+
+        params.isCalibrated = true
+        return params
+    }
+
+    // MARK: - 磁場処理（地磁気除去）
+    private func processField(rawField: SIMD3<Double>, attitude: CMAttitude) -> SIMD3<Double> {
+        let calibratedField = applyCalibration(rawField, with: calibrationParameters)
+        let earthFieldInDeviceFrame = rotateToDeviceFrame(calibrationParameters.hardIronOffset, attitude: attitude)
+        let magnetField = calibratedField - earthFieldInDeviceFrame
+        return magnetField
+    }
+    
+    private func applyCalibration(_ field: SIMD3<Double>, with params: CalibrationParameters) -> SIMD3<Double> {
+        let corrected = field - params.hardIronOffset
+        return params.softIronMatrix * corrected
+    }
+    
+    private func rotateToDeviceFrame(_ vector: SIMD3<Double>, attitude: CMAttitude) -> SIMD3<Double> {
+        let q = attitude.quaternion
+        let rotation = simd_quatd(ix: q.x, iy: q.y, iz: q.z, r: q.w).inverse
+        return rotation.act(vector)
+    }
+
+    func toggleRecording() {
+        isRecording.toggle()
+    }
+}
 
 // MARK: - 方向定義
 enum Direction: String, CaseIterable, Identifiable {
@@ -24,7 +167,6 @@ enum Direction: String, CaseIterable, Identifiable {
     case down = "Down"
 
     var id: String { rawValue }
-
     var color: Color {
         switch self {
         case .top:    return .blue
@@ -34,7 +176,6 @@ enum Direction: String, CaseIterable, Identifiable {
         case .down:   return .red
         }
     }
-
     var systemImage: String {
         switch self {
         case .top:    return "arrow.up.circle.fill"
@@ -44,15 +185,13 @@ enum Direction: String, CaseIterable, Identifiable {
         case .down:   return "arrow.down.circle.fill"
         }
     }
-
-    /// UI レイアウト用オフセット割合 (‑1〜+1)
     var indicatorOffset: CGPoint {
         switch self {
         case .top:    return .init(x:  0, y:  1)
         case .right:  return .init(x:  1, y:  0)
         case .origin: return .init(x:  0, y:  0)
-        case .left:   return .init(x: ‑1, y:  0)
-        case .down:   return .init(x:  0, y: ‑1)
+        case .left:   return .init(x: -1, y:  0)
+        case .down:   return .init(x:  0, y: -1)
         }
     }
 }
@@ -64,7 +203,7 @@ final class DirectionPredictor: ObservableObject {
     @Published var probabilities: [Direction: Double] = [:]
     @Published var status: String = "Loading model…"
 
-    private var model: MagDirectionClassifier? = nil
+    private var model: MagClassify_cali? = nil
     private var cancellables = Set<AnyCancellable>()
 
     init(processor: MagneticFieldProcessor) {
@@ -72,10 +211,9 @@ final class DirectionPredictor: ObservableObject {
         bind(to: processor)
     }
 
-    // モデルロード
     private func loadModel() {
         do {
-            model = try MagDirectionClassifier(configuration: .init())
+            model = try MagClassify_cali(configuration: .init())
             status = "Model ready ✓"
         } catch {
             status = "Model load failed: \(error.localizedDescription)"
@@ -83,7 +221,6 @@ final class DirectionPredictor: ObservableObject {
         }
     }
 
-    // MagneticFieldProcessor から値を購読
     private func bind(to processor: MagneticFieldProcessor) {
         processor.$currentMagneticField
             .receive(on: DispatchQueue.global(qos: .userInitiated))
@@ -93,16 +230,20 @@ final class DirectionPredictor: ObservableObject {
             .store(in: &cancellables)
     }
 
-    // 予測実行
     private func predict(x: Double, y: Double, z: Double) {
         guard let model else { return }
         do {
             let output = try model.prediction(device_x: x, device_y: y, device_z: z)
-            let dir = Direction(rawValue: output.TargetDirection) ?? .origin
+            
+            // Core MLモデルの出力名に合わせて修正 (例: targetDirection)
+            let dir = Direction(rawValue: output.targetDirection) ?? .origin
+            
             var probs: [Direction: Double] = [:]
             for d in Direction.allCases {
-                probs[d] = output.TargetDirectionProbability[d.rawValue] ?? 0
+                // Core MLモデルの出力名に合わせて修正 (例: targetDirectionProbability)
+                probs[d] = output.targetDirectionProbability[d.rawValue] ?? 0
             }
+            
             DispatchQueue.main.async {
                 self.direction   = dir
                 self.probabilities = probs
@@ -124,8 +265,8 @@ struct DirectionDisplay: View {
         ZStack {
             Circle().stroke(Color.gray, lineWidth: 3).frame(width: size, height: size)
             ForEach(Direction.allCases) { dir in
-                let offset = CGSize(width: dir.indicatorOffset.x * (size / 2 ‑ 30),
-                                     height: ‑dir.indicatorOffset.y * (size / 2 ‑ 30))
+                let offset = CGSize(width: dir.indicatorOffset.x * (size / 2 - 30),
+                                     height: -dir.indicatorOffset.y * (size / 2 - 30))
                 Circle()
                     .fill(dir == direction ? dir.color : Color.gray.opacity(0.3))
                     .frame(width: dir == direction ? 42 : 30, height: dir == direction ? 42 : 30)
@@ -143,11 +284,11 @@ struct DirectionDisplay: View {
 
 // MARK: - メインビュー（UI＆操作）
 struct ContentView: View {
-    @StateObject private var processor = MagneticFieldProcessor()
+    @StateObject private var processor: MagneticFieldProcessor
     @StateObject private var predictor: DirectionPredictor
 
     init() {
-        // DirectionPredictor は MagneticFieldProcessor を渡して初期化
+        // MagneticFieldProcessorとDirectionPredictorを初期化し、連携させる
         let p = MagneticFieldProcessor()
         _processor = StateObject(wrappedValue: p)
         _predictor = StateObject(wrappedValue: DirectionPredictor(processor: p))
@@ -160,11 +301,9 @@ struct ContentView: View {
                     Text("Magnet Direction Classifier")
                         .font(.largeTitle).bold()
 
-                    // 方向表示
                     DirectionDisplay(direction: predictor.direction, confidence: predictor.confidence)
                         .padding(.top)
 
-                    // ステータス
                     GroupBox("System Status") {
                         VStack(alignment: .leading, spacing: 6) {
                             Text(predictor.status)
@@ -173,34 +312,31 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
 
-                    // キャリブレーション＆記録系ボタン（processor 既存実装を再利用）
                     VStack(spacing: 12) {
                         Button {
                             processor.startCalibration()
                         } label: {
                             Label("較正", systemImage: "wand.and.stars").frame(maxWidth: .infinity)
                         }
-                        .disabled(processor.isCalibrating || processor.isRecording)
-                        .buttonStyle(.borderedProminent)
-
-                        Button {
-                            processor.toggleRecording()
-                        } label: {
-                            Label(processor.isRecording ? "記録停止" : "記録開始",
-                                  systemImage: processor.isRecording ? "stop.circle.fill" : "record.circle")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .tint(processor.isRecording ? .red : .green)
                         .disabled(processor.isCalibrating)
-                        .buttonStyle(.bordered)
+                        .buttonStyle(.borderedProminent)
                     }
-
                     Spacer(minLength: 50)
                 }
                 .padding()
             }
             .navigationBarHidden(true)
         }
+    }
+}
+
+// MARK: - Quaternion Extension
+extension simd_quatd {
+    func act(_ vector: SIMD3<Double>) -> SIMD3<Double> {
+        let qv = self.imag
+        let uv = cross(qv, vector)
+        let uuv = cross(qv, uv)
+        return vector + 2.0 * (self.real * uv + uuv)
     }
 }
 
